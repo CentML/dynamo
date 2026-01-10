@@ -1300,16 +1300,21 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
     async def _generate_text_mode(self, request, context, request_id):
         """Generate text using OpenAI-compatible format (text-in-text-out)."""
+
         # Get text input using InputParamManager
         input_data = self.input_param_manager.get_input_param(
             request, use_tokenizer=True
         )
 
+        multi_modal_data = await self._extract_multimodal_data(request)
+
         # Build prompt for vLLM
         if isinstance(input_data, list):
-            prompt = TokensPrompt(prompt_token_ids=input_data)
+            prompt = TokensPrompt(
+                prompt_token_ids=input_data, multi_modal_data=multi_modal_data
+            )
         else:
-            prompt = TextPrompt(prompt=input_data)
+            prompt = TextPrompt(prompt=input_data, multi_modal_data=multi_modal_data)
 
         # Build sampling params from OpenAI-style request
         sampling_params = build_sampling_params_openai(
