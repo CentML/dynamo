@@ -893,6 +893,59 @@ class BaseWorkerHandler(ABC):
 
         return vllm_mm_data if vllm_mm_data else None
 
+    async def _extract_multimodal_from_openai_messages(
+        self, request: Dict[str, Any]
+    ) -> Dict[str, Any] | None:
+        messages = request.get("messages")
+        if not messages:
+            return None
+
+        image_urls = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "image_url":
+                    continue
+
+                image_url_data = item.get("image_url")
+                if isinstance(image_url_data, dict):
+                    url = image_url_data.get("url")
+                elif isinstance(image_url_data, str):
+                    url = image_url_data
+                else:
+                    continue
+
+                if url:
+                    image_urls.append(url)
+
+        if not image_urls:
+            return None
+
+        if not self.enable_multimodal:
+            raise ValueError(
+                "Received multimodal data but multimodal processing is not enabled. "
+                "Use --enable-multimodal flag to enable multimodal processing."
+            )
+
+        images = []
+        for url in image_urls:
+            try:
+                image = await self.image_loader.load_image(url)
+                images.append(image)
+                logger.debug(f"Loaded image from OpenAI message: {url[:80]}...")
+            except Exception:
+                logger.exception(f"Failed to load image from {url[:80]}...")
+                raise
+
+        vllm_mm_data = {"image": images[0] if len(images) == 1 else images}
+        logger.debug(
+            f"Extracted {len(images)} image(s) from OpenAI messages for multimodal processing"
+        )
+        return vllm_mm_data
+
     def _build_prompt_from_request(
         self,
         request: Dict[str, Any],
@@ -1306,7 +1359,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             request, use_tokenizer=True
         )
 
-        multi_modal_data = await self._extract_multimodal_data(request)
+        # Extract multimodal data
+        multi_modal_data = await self._extract_multimodal_from_openai_messages(request)
 
         # Build prompt for vLLM
         if isinstance(input_data, list):
