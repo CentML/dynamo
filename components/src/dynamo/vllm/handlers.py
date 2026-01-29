@@ -164,11 +164,10 @@ def build_sampling_params(
     provided_max_tokens = request.get("stop_conditions", {}).get("max_tokens", None)
     token_ids = request.get("token_ids", [])
     input_length = len(token_ids)
-    if model_max_len is not None and (provided_max_tokens is None):
-        # Ensure at least 1 token generation by default when possible
-        dynamic_default = max(1, model_max_len - input_length)
-        sampling_params.max_tokens = dynamic_default
-
+    dynamic_default = max(1, model_max_len - input_length)
+    model_config_max_tokens = default_sampling_params.get("max_tokens")
+    sampling_params.max_tokens = min(filter(lambda x: x is not None, 
+        [provided_max_tokens, dynamic_default, model_config_max_tokens]))
     return sampling_params
 
 

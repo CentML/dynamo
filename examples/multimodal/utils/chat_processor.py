@@ -91,6 +91,8 @@ class ProcessMixIn(ProcessMixInRequired):
             preprocess_result.engine_prompt["prompt_token_ids"]
         )
 
+        default_max_tokens = min(default_max_tokens, self.model_config.max_model_len)
+
         sampling_params = request.to_sampling_params(
             default_max_tokens,
             self.model_config.logits_processor_pattern,
