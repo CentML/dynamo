@@ -210,11 +210,11 @@ def build_sampling_params_openai(
                 setattr(sampling_params, param_key, request[req_key])
 
     # Handle max_tokens
-    if (provided_max_tokens := request.get("max_tokens")) is not None:
-        sampling_params.max_tokens = provided_max_tokens
-    elif model_max_len is not None:
-        # Match token mode behavior: generate until context limit
-        sampling_params.max_tokens = model_max_len
+    provided_max_tokens = request.get("max_tokens")
+    model_config_max_tokens = default_sampling_params.get("max_tokens")
+    
+    sampling_params.max_tokens = min(filter(lambda x: x is not None, 
+        [provided_max_tokens, model_max_len, model_config_max_tokens]))
 
     # Handle stop sequences
     if "stop" in request and request["stop"] is not None:
