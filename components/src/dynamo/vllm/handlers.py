@@ -166,8 +166,12 @@ def build_sampling_params(
     input_length = len(token_ids)
     dynamic_default = max(1, model_max_len - input_length)
     model_config_max_tokens = default_sampling_params.get("max_tokens")
-    sampling_params.max_tokens = min(filter(lambda x: x is not None, 
-        [provided_max_tokens, dynamic_default, model_config_max_tokens]))
+    sampling_params.max_tokens = min(
+        filter(
+            lambda x: x is not None,
+            [provided_max_tokens, dynamic_default, model_config_max_tokens],
+        )
+    )
     return sampling_params
 
 
@@ -183,7 +187,7 @@ def build_sampling_params_openai(
         request: The OpenAI-style request dict with parameters like temperature, max_tokens, etc.
         default_sampling_params: Default sampling parameters to initialize with
         model_max_len: Maximum model context length for computing dynamic max_tokens default
-    
+
     Returns:
         SamplingParams configured from the request
     """
@@ -212,9 +216,13 @@ def build_sampling_params_openai(
     # Handle max_tokens
     provided_max_tokens = request.get("max_tokens")
     model_config_max_tokens = default_sampling_params.get("max_tokens")
-    
-    sampling_params.max_tokens = min(filter(lambda x: x is not None, 
-        [provided_max_tokens, model_max_len, model_config_max_tokens]))
+
+    sampling_params.max_tokens = min(
+        filter(
+            lambda x: x is not None,
+            [provided_max_tokens, model_max_len, model_config_max_tokens],
+        )
+    )
 
     # Handle stop sequences
     if "stop" in request and request["stop"] is not None:
