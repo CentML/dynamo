@@ -13,7 +13,7 @@ from dynamo.vllm.multimodal_utils.encode_utils import (
     get_encoder_components,
 )
 from dynamo.vllm.multimodal_utils.http_client import get_http_client
-from dynamo.vllm.multimodal_utils.image_loader import ImageLoader
+from dynamo.vllm.multimodal_utils.image_loader import ImageLoader, get_decode_thread_pool
 from dynamo.vllm.multimodal_utils.model import (
     SupportedModels,
     construct_mm_data,
@@ -37,6 +37,7 @@ __all__ = [
     "encode_image_embeddings",
     "extract_user_text",
     "get_encoder_components",
+    "get_decode_thread_pool",
     "get_http_client",
     "ImageLoader",
     "SupportedModels",
