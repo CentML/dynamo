@@ -14,13 +14,13 @@
 # limitations under the License.
 
 import asyncio
-import atexit
 import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import TypeAlias, Union
+from urllib.parse import urlparse
 
 import httpx
 import pybase64
@@ -42,51 +42,11 @@ _nvimgcodec = None
 
 # Global thread pool for image decoding operations
 # Default to 8 workers, configurable via DYN_IMAGE_DECODE_WORKERS env var
-_DEFAULT_DECODE_WORKERS = 8
-_decode_thread_pool: ThreadPoolExecutor | None = None
-_decode_pool_lock = threading.Lock()
-
-
-def get_decode_thread_pool(max_workers: int | None = None) -> ThreadPoolExecutor:
-    """
-    Get or create the global thread pool for image decoding.
-
-    Args:
-        max_workers: Maximum number of worker threads. If None, uses
-                     DYN_IMAGE_DECODE_WORKERS env var or defaults to 8.
-
-    Returns:
-        ThreadPoolExecutor for image decoding operations
-    """
-    global _decode_thread_pool
-
-    if _decode_thread_pool is None:
-        with _decode_pool_lock:
-            # Double-check after acquiring lock
-            if _decode_thread_pool is None:
-                if max_workers is None:
-                    max_workers = int(
-                        os.environ.get("DYN_IMAGE_DECODE_WORKERS", _DEFAULT_DECODE_WORKERS)
-                    )
-                _decode_thread_pool = ThreadPoolExecutor(
-                    max_workers=max_workers,
-                    thread_name_prefix="image_decode_",
-                )
-                logger.info(
-                    f"Initialized global image decode thread pool with {max_workers} workers"
-                )
-                # Register cleanup on exit
-                atexit.register(_shutdown_decode_pool)
-
-    return _decode_thread_pool
-
-
-def _shutdown_decode_pool():
-    """Shutdown the global decode thread pool on exit."""
-    global _decode_thread_pool
-    if _decode_thread_pool is not None:
-        _decode_thread_pool.shutdown(wait=False)
-        logger.debug("Shutdown global image decode thread pool")
+_IMAGE_DECODE_WORKERS = int(os.environ.get("DYN_IMAGE_DECODE_WORKERS", 8))
+_decode_thread_pool = ThreadPoolExecutor(
+    max_workers=_IMAGE_DECODE_WORKERS,
+    thread_name_prefix="image_decode_",
+)
 
 
 def _get_nvimgcodec():
@@ -116,7 +76,6 @@ class ImageLoader:
         http_timeout: float = 30.0,
         use_nvimgcodec: bool = True,
         image_mode: str = "RGB",
-        decode_workers: int | None = None,
     ):
         """
         Initialize the ImageLoader.
@@ -127,16 +86,12 @@ class ImageLoader:
             use_nvimgcodec: If True, use nvimgcodec for GPU-accelerated decoding
                            (returns 4D torch.Tensor). If False, use PIL (returns Image.Image)
             image_mode: Target image mode for PIL conversion (default: "RGB")
-            decode_workers: Number of worker threads for image decoding. If None,
-                           uses DYN_IMAGE_DECODE_WORKERS env var or defaults to 8.
         """
         self._http_timeout = http_timeout
         self._use_nvimgcodec = use_nvimgcodec
         self._image_mode = image_mode
         self._image_cache: dict[str, ImageOutput] = {}
         self._cache_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=cache_size)
-        # Initialize the thread pool (uses global pool)
-        self._thread_pool = get_decode_thread_pool(decode_workers)
 
     def _decode_with_nvimgcodec(self, data: bytes) -> torch.Tensor:
         """
@@ -257,12 +212,12 @@ class ImageLoader:
                 # nvimgcodec decoding (GPU-accelerated, returns 4D tensor)
                 # Offload to thread pool to avoid blocking the event loop
                 image_result = await loop.run_in_executor(
-                    self._thread_pool, self._decode_with_nvimgcodec, image_bytes
+                    _decode_thread_pool, self._decode_with_nvimgcodec, image_bytes
                 )
             else:
                 # PIL decoding (CPU-bound, offload to thread pool)
                 image_result = await loop.run_in_executor(
-                    self._thread_pool, self._decode_with_pil, image_bytes
+                    _decode_thread_pool, self._decode_with_pil, image_bytes
                 )
 
             # Cache HTTP(S) URLs
@@ -284,39 +239,3 @@ class ImageLoader:
         except Exception as e:
             logger.error(f"Error loading image: {e}")
             raise ValueError(f"Failed to load image: {e}")
-
-    async def load_images(self, image_urls: list[str]) -> list[ImageOutput]:
-        """
-        Load multiple images concurrently.
-
-        This method fetches and decodes multiple images in parallel, utilizing
-        the thread pool for decoding operations. This is more efficient than
-        calling load_image() sequentially for each image.
-
-        Args:
-            image_urls: List of URLs (http/https) or data URIs
-
-        Returns:
-            List of decoded images in the same order as input URLs.
-            Each element is torch.Tensor (if use_nvimgcodec=True) or PIL Image.
-
-        Raises:
-            ValueError: If any image fails to load (all-or-nothing semantics)
-        """
-        if not image_urls:
-            return []
-
-        if len(image_urls) == 1:
-            return [await self.load_image(image_urls[0])]
-
-        # Load all images concurrently
-        tasks = [self.load_image(url) for url in image_urls]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Check for exceptions and raise the first one found
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Failed to load image at index {i} ({image_urls[i]}): {result}")
-                raise result
-
-        return results
