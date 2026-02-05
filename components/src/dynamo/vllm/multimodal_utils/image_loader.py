@@ -14,31 +14,175 @@
 # limitations under the License.
 
 import asyncio
-import base64
-import binascii
 import logging
+import threading
 from io import BytesIO
+from typing import TypeAlias, Union
 from urllib.parse import urlparse
 
 import httpx
+import pybase64
+import torch
 from PIL import Image
 
 from .http_client import get_http_client
 
 logger = logging.getLogger(__name__)
 
+# Image output can be either PIL Image or Tensor (from nvimgcodec)
+ImageOutput: TypeAlias = Union[Image.Image, torch.Tensor]
+
+# Thread-local storage for nvimgcodec decoders
+_thread_local = threading.local()
+
+# Lazy import for nvimgcodec
+_nvimgcodec = None
+
+
+def _get_nvimgcodec():
+    """Lazy import nvimgcodec to avoid import errors if not installed."""
+    global _nvimgcodec
+    if _nvimgcodec is None:
+        from nvidia import nvimgcodec
+        _nvimgcodec = nvimgcodec
+    return _nvimgcodec
+
+
+def get_decoder():
+    """Get or create a thread-local nvimgcodec decoder instance."""
+    if not hasattr(_thread_local, "decoder"):
+        nvimgcodec = _get_nvimgcodec()
+        _thread_local.decoder = nvimgcodec.Decoder()
+        logger.info("nvimgcodec decoder initialized for thread")
+    return _thread_local.decoder
+
 
 class ImageLoader:
     CACHE_SIZE_MAXIMUM = 8
 
     def __init__(
-        self, cache_size: int = CACHE_SIZE_MAXIMUM, http_timeout: float = 30.0
+        self,
+        cache_size: int = CACHE_SIZE_MAXIMUM,
+        http_timeout: float = 30.0,
+        use_nvimgcodec: bool = True,
+        image_mode: str = "RGB",
     ):
+        """
+        Initialize the ImageLoader.
+
+        Args:
+            cache_size: Maximum number of images to cache
+            http_timeout: Timeout for HTTP requests
+            use_nvimgcodec: If True, use nvimgcodec for GPU-accelerated decoding
+                           (returns 4D torch.Tensor). If False, use PIL (returns Image.Image)
+            image_mode: Target image mode for PIL conversion (default: "RGB")
+        """
         self._http_timeout = http_timeout
-        self._image_cache: dict[str, Image.Image] = {}
+        self._use_nvimgcodec = use_nvimgcodec
+        self._image_mode = image_mode
+        self._image_cache: dict[str, ImageOutput] = {}
         self._cache_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=cache_size)
 
-    async def load_image(self, image_url: str) -> Image.Image:
+    def _decode_with_nvimgcodec(self, data: bytes) -> torch.Tensor:
+        """
+        Decode image bytes using nvimgcodec for GPU-accelerated decoding.
+
+        Args:
+            data: Raw image bytes
+
+        Returns:
+            torch.Tensor in NCHW format (4D) on CUDA device.
+            Shape: (1, C, H, W) - batch dimension added so vLLM treats it as
+            a batch of images, not as embeddings.
+        """
+        decoder = get_decoder()
+        decoded = decoder.decode(data)
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        tensor = torch.as_tensor(decoded, device=device)
+        # HWC -> CHW
+        tensor = tensor.permute(2, 0, 1)
+        # Add batch dimension: CHW -> NCHW (1, C, H, W)
+        # This is critical: 3D tensors are interpreted as embeddings by vLLM,
+        # but 4D tensors are interpreted as a batch of images.
+        tensor = tensor.unsqueeze(0)
+
+        return tensor
+
+    def _decode_with_pil(self, data: bytes) -> Image.Image:
+        """
+        Decode image bytes using PIL.
+
+        Args:
+            data: Raw image bytes
+
+        Returns:
+            PIL Image converted to the target image mode
+        """
+        image = Image.open(BytesIO(data))
+
+        # Validate image format
+        if image.format not in ("JPEG", "PNG", "WEBP", "GIF"):
+            raise ValueError(f"Unsupported image format: {image.format}")
+
+        # Convert to target mode
+        if image.mode != self._image_mode:
+            image = image.convert(self._image_mode)
+
+        return image
+
+    async def _fetch_image_bytes(self, image_url: str) -> bytes:
+        """
+        Fetch image bytes from a URL or data URI.
+
+        Args:
+            image_url: URL (http/https) or data URI (data:image/...;base64,...)
+
+        Returns:
+            Raw image bytes
+        """
+        parsed_url = urlparse(image_url)
+
+        if parsed_url.scheme == "data":
+            # Parse data URL format: data:[<media type>][;base64],<data>
+            if not parsed_url.path.startswith("image/"):
+                raise ValueError("Data URL must be an image type")
+
+            # Split the path into media type and data
+            media_type, data = parsed_url.path.split(",", 1)
+            if ";base64" not in media_type:
+                raise ValueError("Data URL must be base64 encoded")
+
+            try:
+                # Use pybase64 for faster base64 decoding
+                return pybase64.b64decode(data, validate=True)
+            except Exception as e:
+                raise ValueError(f"Invalid base64 encoding: {e}")
+
+        elif parsed_url.scheme in ("http", "https"):
+            http_client = get_http_client(self._http_timeout)
+
+            response = await http_client.get(image_url)
+            response.raise_for_status()
+
+            if not response.content:
+                raise ValueError("Empty response content from image URL")
+
+            return response.content
+
+        else:
+            raise ValueError(f"Invalid image source scheme: {parsed_url.scheme}")
+
+    async def load_image(self, image_url: str) -> ImageOutput:
+        """
+        Load an image from a URL or data URI.
+
+        Args:
+            image_url: URL (http/https) or data URI (data:image/...;base64,...)
+
+        Returns:
+            torch.Tensor in NCHW format (if use_nvimgcodec=True) or PIL Image
+        """
         parsed_url = urlparse(image_url)
 
         # For HTTP(S) URLs, check cache first
@@ -49,55 +193,31 @@ class ImageLoader:
                 return self._image_cache[image_url_lower]
 
         try:
-            if parsed_url.scheme == "data":
-                # Parse data URL format: data:[<media type>][;base64],<data>
-                if not parsed_url.path.startswith("image/"):
-                    raise ValueError("Data URL must be an image type")
+            # Fetch image bytes
+            image_bytes = await self._fetch_image_bytes(image_url)
 
-                # Split the path into media type and data
-                media_type, data = parsed_url.path.split(",", 1)
-                if ";base64" not in media_type:
-                    raise ValueError("Data URL must be base64 encoded")
-
-                try:
-                    image_bytes = base64.b64decode(data)
-                    image_data = BytesIO(image_bytes)
-                except binascii.Error as e:
-                    raise ValueError(f"Invalid base64 encoding: {e}")
-            elif parsed_url.scheme in ("http", "https"):
-                http_client = get_http_client(self._http_timeout)
-
-                response = await http_client.get(image_url)
-                response.raise_for_status()
-
-                if not response.content:
-                    raise ValueError("Empty response content from image URL")
-
-                image_data = BytesIO(response.content)
+            # Decode the image
+            if self._use_nvimgcodec:
+                # nvimgcodec decoding (GPU-accelerated, returns 4D tensor)
+                image_result = self._decode_with_nvimgcodec(image_bytes)
             else:
-                raise ValueError(f"Invalid image source scheme: {parsed_url.scheme}")
-
-            # PIL is sync, so offload to a thread to avoid blocking the event loop
-            image = await asyncio.to_thread(Image.open, image_data)
-
-            # Validate image format and convert to RGB
-            if image.format not in ("JPEG", "PNG", "WEBP"):
-                raise ValueError(f"Unsupported image format: {image.format}")
-
-            image_converted = image.convert("RGB")
+                # PIL decoding (CPU-bound, offload to thread)
+                image_result = await asyncio.to_thread(
+                    self._decode_with_pil, image_bytes
+                )
 
             # Cache HTTP(S) URLs
             if parsed_url.scheme in ("http", "https"):
                 image_url_lower = image_url.lower()
-                # Cache the image for future use, and evict the oldest image if the cache is full
+                # Cache the image for future use, and evict the oldest image if full
                 if self._cache_queue.full():
                     oldest_image_url = await self._cache_queue.get()
                     del self._image_cache[oldest_image_url]
 
-                self._image_cache[image_url_lower] = image_converted
+                self._image_cache[image_url_lower] = image_result
                 await self._cache_queue.put(image_url_lower)
 
-            return image_converted
+            return image_result
 
         except httpx.HTTPError as e:
             logger.error(f"HTTP error loading image: {e}")
