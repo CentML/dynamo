@@ -105,8 +105,10 @@ class ImageLoader:
             Shape: (1, C, H, W) - batch dimension added so vLLM treats it as
             a batch of images, not as embeddings.
         """
+        nvimgcodec = _get_nvimgcodec()
         decoder = get_decoder()
-        decoded = decoder.decode(data)
+        code_stream = nvimgcodec.CodeStream(data)
+        decoded = decoder.decode(code_stream)
 
         device = torch.device("cuda", torch.cuda.current_device())
         tensor = torch.as_tensor(decoded, device=device)
