@@ -69,6 +69,7 @@ def get_decoder():
 
 class ImageLoader:
     CACHE_SIZE_MAXIMUM = 8
+    DEFAULT_MAX_PENDING = 64
 
     def __init__(
         self,
@@ -76,6 +77,7 @@ class ImageLoader:
         http_timeout: float = 30.0,
         use_nvimgcodec: bool = True,
         image_mode: str = "RGB",
+        max_pending: int | None = None,
     ):
         """
         Initialize the ImageLoader.
@@ -86,12 +88,34 @@ class ImageLoader:
             use_nvimgcodec: If True, use nvimgcodec for GPU-accelerated decoding
                            (returns 4D torch.Tensor). If False, use PIL (returns Image.Image)
             image_mode: Target image mode for PIL conversion (default: "RGB")
+            max_pending: Maximum number of decoded images waiting for the vLLM
+                         scheduler to consume them. Decode will block if this
+                         limit is reached. Defaults to DYN_IMAGE_MAX_PENDING
+                         env var, or 64.
         """
         self._http_timeout = http_timeout
         self._use_nvimgcodec = use_nvimgcodec
         self._image_mode = image_mode
         self._image_cache: dict[str, ImageOutput] = {}
         self._cache_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=cache_size)
+
+        if max_pending is None:
+            max_pending = int(
+                os.environ.get("DYN_IMAGE_MAX_PENDING", self.DEFAULT_MAX_PENDING)
+            )
+        self._pending_semaphore = asyncio.Semaphore(max_pending)
+        self._max_pending = max_pending
+
+    def mark_consumed(self, count: int = 1):
+        """
+        Signal that decoded images have been consumed by the vLLM prefill batch.
+        Call this after the prefill batch completes to allow more images to be decoded.
+
+        Args:
+            count: Number of images consumed (default: 1)
+        """
+        for _ in range(count):
+            self._pending_semaphore.release()
 
     def _decode_with_nvimgcodec(self, data: bytes) -> torch.Tensor:
         """
@@ -207,6 +231,10 @@ class ImageLoader:
         try:
             # Fetch image bytes
             image_bytes = await self._fetch_image_bytes(image_url)
+
+            # Wait if too many decoded images are pending in the vLLM scheduler.
+            # Released when the caller invokes mark_consumed() after prefill.
+            await self._pending_semaphore.acquire()
 
             # Decode the image using thread pool to avoid blocking event loop
             loop = asyncio.get_running_loop()

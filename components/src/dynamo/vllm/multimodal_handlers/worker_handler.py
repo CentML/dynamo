@@ -170,6 +170,7 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
         logger.debug(f"Received PD request: {{ id: {request.request_id} }}.")
 
         multi_modal_data = defaultdict(list)
+        num_loaded_images = 0
         for mi in request.multimodal_inputs:
             # ECConnector consumer mode: vLLM loads embeddings automatically from disk
             # We need to pass multimodal_input so vLLM can generate mm_hash and look up cache
@@ -273,6 +274,8 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
                     await self.image_loader.load_image(mi.multimodal_input.image_url)
                 )
 
+            num_loaded_images += 1
+
         # Remove the image features from the request as they are not required
         request.multimodal_inputs = None
 
@@ -304,61 +307,66 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
             request_id=pd_request.request_id,
         )
 
-        if self.enable_disagg and self.decode_worker_client:
-            decode_request = copy.deepcopy(request)
-            async for prefill_response in gen:
-                # For Qwen VL models with mRoPE: Keep the ORIGINAL unexpanded prompt.
-                # The decode worker will pass multi_modal_data which causes vLLM to
-                # expand the prompt identically to prefill, ensuring block counts match.
-                #
-                # For other models: Use the expanded prompt from prefill response.
-                # These models don't pass multi_modal_data in decode, so they need
-                # the already-expanded prompt to match the KV cache layout.
-                if not is_qwen_vl_model(self.config.model):
-                    decode_request.engine_prompt[
-                        "prompt_token_ids"
-                    ] = prefill_response.prompt_token_ids
-                logger.debug(
-                    f"Prefill response kv_transfer_params: {prefill_response.kv_transfer_params}"
-                )
-                extra_args = decode_request.sampling_params.extra_args or {}
-                extra_args["kv_transfer_params"] = prefill_response.kv_transfer_params
-                extra_args.pop("serialized_request", None)
-                decode_request.sampling_params.extra_args = extra_args
-                logger.debug("Decode request: %s", decode_request)
-                async for (
-                    decode_response
-                ) in await self.decode_worker_client.round_robin(
-                    decode_request.model_dump_json()
-                ):
-                    output = MyRequestOutput.model_validate_json(decode_response.data())
+        try:
+            if self.enable_disagg and self.decode_worker_client:
+                decode_request = copy.deepcopy(request)
+                async for prefill_response in gen:
+                    # For Qwen VL models with mRoPE: Keep the ORIGINAL unexpanded prompt.
+                    # The decode worker will pass multi_modal_data which causes vLLM to
+                    # expand the prompt identically to prefill, ensuring block counts match.
+                    #
+                    # For other models: Use the expanded prompt from prefill response.
+                    # These models don't pass multi_modal_data in decode, so they need
+                    # the already-expanded prompt to match the KV cache layout.
+                    if not is_qwen_vl_model(self.config.model):
+                        decode_request.engine_prompt[
+                            "prompt_token_ids"
+                        ] = prefill_response.prompt_token_ids
+                    logger.debug(
+                        f"Prefill response kv_transfer_params: {prefill_response.kv_transfer_params}"
+                    )
+                    extra_args = decode_request.sampling_params.extra_args or {}
+                    extra_args["kv_transfer_params"] = prefill_response.kv_transfer_params
+                    extra_args.pop("serialized_request", None)
+                    decode_request.sampling_params.extra_args = extra_args
+                    logger.debug("Decode request: %s", decode_request)
+                    async for (
+                        decode_response
+                    ) in await self.decode_worker_client.round_robin(
+                        decode_request.model_dump_json()
+                    ):
+                        output = MyRequestOutput.model_validate_json(decode_response.data())
+                        yield MyRequestOutput(
+                            request_id=output.request_id,
+                            prompt=output.prompt,
+                            prompt_token_ids=output.prompt_token_ids,
+                            prompt_logprobs=output.prompt_logprobs,
+                            outputs=output.outputs,
+                            finished=output.finished,
+                            metrics=output.metrics,
+                            kv_transfer_params=output.kv_transfer_params,
+                        ).model_dump_json()
+
+            else:
+                async for response in gen:
+                    logger.debug(
+                        f"Response kv_transfer_params: {response.kv_transfer_params}"
+                    )
+                    logger.debug(
+                        f"length of expanded prompt ids: {len(response.prompt_token_ids)}"
+                    )
+                    # logger.info(f"Response outputs: {response.outputs}")
                     yield MyRequestOutput(
-                        request_id=output.request_id,
-                        prompt=output.prompt,
-                        prompt_token_ids=output.prompt_token_ids,
-                        prompt_logprobs=output.prompt_logprobs,
-                        outputs=output.outputs,
-                        finished=output.finished,
-                        metrics=output.metrics,
-                        kv_transfer_params=output.kv_transfer_params,
+                        request_id=response.request_id,
+                        prompt=response.prompt,
+                        prompt_token_ids=response.prompt_token_ids,
+                        prompt_logprobs=response.prompt_logprobs,
+                        outputs=response.outputs,
+                        finished=response.finished,
+                        metrics=response.metrics,
+                        kv_transfer_params=response.kv_transfer_params,
                     ).model_dump_json()
 
-        else:
-            async for response in gen:
-                logger.debug(
-                    f"Response kv_transfer_params: {response.kv_transfer_params}"
-                )
-                logger.debug(
-                    f"length of expanded prompt ids: {len(response.prompt_token_ids)}"
-                )
-                # logger.info(f"Response outputs: {response.outputs}")
-                yield MyRequestOutput(
-                    request_id=response.request_id,
-                    prompt=response.prompt,
-                    prompt_token_ids=response.prompt_token_ids,
-                    prompt_logprobs=response.prompt_logprobs,
-                    outputs=response.outputs,
-                    finished=response.finished,
-                    metrics=response.metrics,
-                    kv_transfer_params=response.kv_transfer_params,
-                ).model_dump_json()
+        finally:
+            if num_loaded_images > 0:
+                self.image_loader.mark_consumed(num_loaded_images)
