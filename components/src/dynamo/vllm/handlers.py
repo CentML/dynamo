@@ -1363,6 +1363,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
+            finally:
+                if multi_modal_data is not None:
+                    self.image_loader.mark_consumed()
 
     async def _generate_text_mode(self, request, context, request_id):
         """Generate text using OpenAI-compatible format (text-in-text-out)."""
@@ -1455,6 +1458,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
+            finally:
+                if multi_modal_data is not None:
+                    self.image_loader.mark_consumed()
 
 
 class PrefillWorkerHandler(BaseWorkerHandler):
