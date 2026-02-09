@@ -38,6 +38,7 @@ _thread_local = threading.local()
 
 # Lazy import for nvimgcodec
 _nvimgcodec = None
+_nvimgcodec_available: bool | None = None  # None = not yet probed
 
 # Global thread pool for image decoding operations
 # Default to 8 workers, configurable via DYN_IMAGE_DECODE_WORKERS env var
@@ -48,8 +49,20 @@ _decode_thread_pool = ThreadPoolExecutor(
 )
 
 
+def _is_nvimgcodec_available() -> bool:
+    """Check whether nvimgcodec can be imported. Result is cached."""
+    global _nvimgcodec_available
+    if _nvimgcodec_available is None:
+        try:
+            _get_nvimgcodec()
+            _nvimgcodec_available = True
+        except (ImportError, ModuleNotFoundError):
+            _nvimgcodec_available = False
+    return _nvimgcodec_available
+
+
 def _get_nvimgcodec():
-    """Lazy import nvimgcodec to avoid import errors if not installed."""
+    """Lazy import nvimgcodec. Raises ImportError if not installed."""
     global _nvimgcodec
     if _nvimgcodec is None:
         from nvidia import nvimgcodec
@@ -83,7 +96,8 @@ class ImageLoader:
         Args:
             http_timeout: Timeout for HTTP requests
             use_nvimgcodec: If True, use nvimgcodec for GPU-accelerated decoding
-                           (returns 4D torch.Tensor). If False, use PIL (returns Image.Image)
+                           (returns 4D torch.Tensor). If False, use PIL (returns Image.Image).
+                           Falls back to PIL automatically if nvimgcodec is not installed.
             image_mode: Target image mode for PIL conversion (default: "RGB")
             max_pending: Maximum number of decoded images waiting for the vLLM
                          scheduler to consume them. Decode will block if this
@@ -91,8 +105,16 @@ class ImageLoader:
                          env var, or 64.
         """
         self._http_timeout = http_timeout
-        self._use_nvimgcodec = use_nvimgcodec
         self._image_mode = image_mode
+
+        # Fall back to PIL if nvimgcodec was requested but is not installed
+        if use_nvimgcodec and not _is_nvimgcodec_available():
+            logger.warning(
+                "nvimgcodec requested but not installed — "
+                "falling back to PIL for image decoding"
+            )
+            use_nvimgcodec = False
+        self._use_nvimgcodec = use_nvimgcodec
 
         if max_pending is None:
             max_pending = int(

@@ -1378,6 +1378,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         # Extract multimodal data
         multi_modal_data = await self._extract_multimodal_from_openai_messages(request)
+<<<<<<< HEAD
 
         try:
             # Build prompt for vLLM
@@ -1388,6 +1389,36 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             else:
                 prompt = TextPrompt(
                     prompt=input_data, multi_modal_data=multi_modal_data
+=======
+
+        # Build prompt for vLLM
+        if isinstance(input_data, list):
+            prompt = TokensPrompt(
+                prompt_token_ids=input_data, multi_modal_data=multi_modal_data
+            )
+        else:
+            prompt = TextPrompt(prompt=input_data, multi_modal_data=multi_modal_data)
+
+        # Build sampling params from OpenAI-style request
+        sampling_params = build_sampling_params_openai(
+            request, self.default_sampling_params, self.model_max_len
+        )
+
+        dp_rank = request.get("dp_rank", None)
+        openai_request_id = request.get("id") or request.get("request_id", request_id)
+        previous_text = ""
+
+        trace_headers = build_trace_headers(context)
+
+        async with self._abort_monitor(context, request_id):
+            try:
+                gen = self.engine_client.generate(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    data_parallel_rank=dp_rank,
+                    trace_headers=trace_headers,
+>>>>>>> 876e6d62c943608a6f42cb20805b82b544bcedd5
                 )
 
             # Build sampling params from OpenAI-style request
