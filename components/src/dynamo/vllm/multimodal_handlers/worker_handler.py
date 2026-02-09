@@ -170,6 +170,7 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
         logger.debug(f"Received PD request: {{ id: {request.request_id} }}.")
 
         multi_modal_data = defaultdict(list)
+        num_loaded_images = 0
         for mi in request.multimodal_inputs:
             # ECConnector consumer mode: vLLM loads embeddings automatically from disk
             # We need to pass multimodal_input so vLLM can generate mm_hash and look up cache
@@ -273,6 +274,8 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
                     await self.image_loader.load_image(mi.multimodal_input.image_url)
                 )
 
+            num_loaded_images += 1
+
         # Remove the image features from the request as they are not required
         request.multimodal_inputs = None
 
@@ -362,3 +365,5 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
                     metrics=response.metrics,
                     kv_transfer_params=response.kv_transfer_params,
                 ).model_dump_json()
+
+        self.image_loader.mark_consumed(num_loaded_images)
