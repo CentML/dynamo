@@ -208,9 +208,7 @@ class ImageLoader:
 
                     # Validate image format and convert to RGB
                     if image.format not in ("JPEG", "PNG", "WEBP"):
-                        raise ValueError(
-                            f"Unsupported image format: {image.format}"
-                        )
+                        raise ValueError(f"Unsupported image format: {image.format}")
 
                     image_converted = image.convert("RGB")
 
