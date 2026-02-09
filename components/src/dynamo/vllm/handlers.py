@@ -1286,87 +1286,86 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         # Extract and decode multimodal data if present
         multi_modal_data = await self._extract_multimodal_data(request)
 
-        try:
-            # Build prompt from request (handles both prompt_embeds and token_ids)
-            prompt, embedding_sequence_length, error = self._build_prompt_from_request(
-                request, request_id, multi_modal_data
+        # Build prompt from request (handles both prompt_embeds and token_ids)
+        prompt, embedding_sequence_length, error = self._build_prompt_from_request(
+            request, request_id, multi_modal_data
+        )
+        if error is not None:
+            yield error
+            return
+
+        # Build sampling params from request
+        sampling_params = build_sampling_params(
+            request, self.default_sampling_params, self.model_max_len
+        )
+
+        prefill_result = request.get("prefill_result")
+        if prefill_result and isinstance(prefill_result, dict):
+            kv_params = prefill_result.get("disaggregated_params", {}).get(
+                "kv_transfer_params"
             )
-            if error is not None:
-                yield error
-                return
+        else:
+            kv_params = None
 
-            # Build sampling params from request
-            sampling_params = build_sampling_params(
-                request, self.default_sampling_params, self.model_max_len
+        if kv_params is not None:
+            if sampling_params.extra_args is None:
+                sampling_params.extra_args = {}
+            sampling_params.extra_args["kv_transfer_params"] = kv_params
+            logger.debug(
+                f"Using disaggregated params from prefill for request {request_id}"
+            )
+        prefill_prompt_tokens_details = (
+            prefill_result.get("prompt_tokens_details") if prefill_result else None
+        )
+
+        # Extract LoRA request if present
+        # Check if model name matches a loaded LoRA adapter
+        lora_request = None
+        model_name = request.get("model")
+
+        if model_name and model_name in self.lora_id_for_name:
+            lora_id = self.lora_id_for_name[model_name]
+            lora_request = LoRARequest(
+                lora_name=model_name,
+                lora_int_id=lora_id,
+                lora_path=self.lora_name_to_path[model_name],
+            )
+            logger.info(
+                f"Decode request {request_id} will use LoRA adapter: {model_name} (ID: {lora_id})"
+            )
+        else:
+            logger.debug(
+                f"Decode request {request_id} has no LoRA specified (model: {model_name})"
             )
 
-            prefill_result = request.get("prefill_result")
-            if prefill_result and isinstance(prefill_result, dict):
-                kv_params = prefill_result.get("disaggregated_params", {}).get(
-                    "kv_transfer_params"
-                )
-            else:
-                kv_params = None
+        dp_rank = request.get("dp_rank", None)
 
-            if kv_params is not None:
-                if sampling_params.extra_args is None:
-                    sampling_params.extra_args = {}
-                sampling_params.extra_args["kv_transfer_params"] = kv_params
-                logger.debug(
-                    f"Using disaggregated params from prefill for request {request_id}"
-                )
-            prefill_prompt_tokens_details = (
-                prefill_result.get("prompt_tokens_details") if prefill_result else None
-            )
+        trace_headers = build_trace_headers(context)
 
-            # Extract LoRA request if present
-            # Check if model name matches a loaded LoRA adapter
-            lora_request = None
-            model_name = request.get("model")
-
-            if model_name and model_name in self.lora_id_for_name:
-                lora_id = self.lora_id_for_name[model_name]
-                lora_request = LoRARequest(
-                    lora_name=model_name,
-                    lora_int_id=lora_id,
-                    lora_path=self.lora_name_to_path[model_name],
-                )
-                logger.info(
-                    f"Decode request {request_id} will use LoRA adapter: {model_name} (ID: {lora_id})"
-                )
-            else:
-                logger.debug(
-                    f"Decode request {request_id} has no LoRA specified (model: {model_name})"
-                )
-
-            dp_rank = request.get("dp_rank", None)
-
-            trace_headers = build_trace_headers(context)
-
-            async with self._abort_monitor(context, request_id):
-                try:
-                    async for tok in self.generate_tokens(
-                        prompt,
-                        sampling_params,
-                        request_id,
-                        data_parallel_rank=dp_rank,
-                        lora_request=lora_request,
-                        embedding_sequence_length=embedding_sequence_length,
-                        trace_headers=trace_headers,
-                    ):
-                        if prefill_result is not None and "completion_usage" in tok:
-                            tok["completion_usage"][
-                                "prompt_tokens_details"
-                            ] = prefill_prompt_tokens_details
-                        yield tok
-                except EngineDeadError as e:
-                    logger.error(f"vLLM EngineDeadError: {e}")
-                    logger.warning("Initiating Dynamo Runtime shutdown.")
-                    self.runtime.shutdown()
-                    os._exit(1)
-        finally:
-            if multi_modal_data is not None:
-                self.image_loader.mark_consumed()
+        async with self._abort_monitor(context, request_id):
+            try:
+                async for tok in self.generate_tokens(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    data_parallel_rank=dp_rank,
+                    lora_request=lora_request,
+                    embedding_sequence_length=embedding_sequence_length,
+                    trace_headers=trace_headers,
+                ):
+                    if prefill_result is not None and "completion_usage" in tok:
+                        tok["completion_usage"][
+                            "prompt_tokens_details"
+                        ] = prefill_prompt_tokens_details
+                    yield tok
+            except EngineDeadError as e:
+                logger.error(f"vLLM EngineDeadError: {e}")
+                logger.warning("Initiating Dynamo Runtime shutdown.")
+                self.runtime.shutdown()
+                os._exit(1)
+            finally:
+                if multi_modal_data is not None:
+                    self.image_loader.mark_consumed()
 
     async def _generate_text_mode(self, request, context, request_id):
         """Generate text using OpenAI-compatible format (text-in-text-out)."""
@@ -1379,94 +1378,93 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         # Extract multimodal data
         multi_modal_data = await self._extract_multimodal_from_openai_messages(request)
 
-        try:
-            # Build prompt for vLLM
-            if isinstance(input_data, list):
-                prompt = TokensPrompt(
-                    prompt_token_ids=input_data, multi_modal_data=multi_modal_data
-                )
-            else:
-                prompt = TextPrompt(
-                    prompt=input_data, multi_modal_data=multi_modal_data
-                )
-
-            # Build sampling params from OpenAI-style request
-            sampling_params = build_sampling_params_openai(
-                request, self.default_sampling_params, self.model_max_len
+        # Build prompt for vLLM
+        if isinstance(input_data, list):
+            prompt = TokensPrompt(
+                prompt_token_ids=input_data, multi_modal_data=multi_modal_data
+            )
+        else:
+            prompt = TextPrompt(
+                prompt=input_data, multi_modal_data=multi_modal_data
             )
 
-            dp_rank = request.get("dp_rank", None)
-            openai_request_id = request.get("id") or request.get(
-                "request_id", request_id
-            )
-            previous_text = ""
+        # Build sampling params from OpenAI-style request
+        sampling_params = build_sampling_params_openai(
+            request, self.default_sampling_params, self.model_max_len
+        )
 
-            trace_headers = build_trace_headers(context)
+        dp_rank = request.get("dp_rank", None)
+        openai_request_id = request.get("id") or request.get(
+            "request_id", request_id
+        )
+        previous_text = ""
 
-            async with self._abort_monitor(context, request_id):
-                try:
-                    gen = self.engine_client.generate(
-                        prompt,
-                        sampling_params,
-                        request_id,
-                        data_parallel_rank=dp_rank,
-                        trace_headers=trace_headers,
-                    )
+        trace_headers = build_trace_headers(context)
 
-                    async for res in gen:
-                        if not res.outputs:
-                            yield {
-                                "id": openai_request_id,
-                                "created": int(time.time()),
-                                "object": "chat.completion.chunk",
-                                "model": "unknown",
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"role": "assistant", "content": ""},
-                                        "finish_reason": "error",
-                                    }
-                                ],
-                            }
-                            break
+        async with self._abort_monitor(context, request_id):
+            try:
+                gen = self.engine_client.generate(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    data_parallel_rank=dp_rank,
+                    trace_headers=trace_headers,
+                )
 
-                        output = res.outputs[0]
-                        # Calculate the delta text (new text since last chunk)
-                        delta_text = output.text[len(previous_text) :]
-                        previous_text = output.text
-
-                        choice_data = {
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": delta_text,
-                            },
-                            "finish_reason": output.finish_reason,
-                        }
-
-                        chunk = {
+                async for res in gen:
+                    if not res.outputs:
+                        yield {
                             "id": openai_request_id,
                             "created": int(time.time()),
                             "object": "chat.completion.chunk",
                             "model": "unknown",
-                            "choices": [choice_data],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": ""},
+                                    "finish_reason": "error",
+                                }
+                            ],
                         }
+                        break
 
-                        if output.finish_reason:
-                            chunk["usage"] = BaseWorkerHandler._build_completion_usage(
-                                request_output=res,
-                            )
+                    output = res.outputs[0]
+                    # Calculate the delta text (new text since last chunk)
+                    delta_text = output.text[len(previous_text) :]
+                    previous_text = output.text
 
-                        yield chunk
+                    choice_data = {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": delta_text,
+                        },
+                        "finish_reason": output.finish_reason,
+                    }
 
-                except EngineDeadError as e:
-                    logger.error(f"vLLM EngineDeadError: {e}")
-                    logger.warning("Initiating Dynamo Runtime shutdown.")
-                    self.runtime.shutdown()
-                    os._exit(1)
-        finally:
-            if multi_modal_data is not None:
-                self.image_loader.mark_consumed()
+                    chunk = {
+                        "id": openai_request_id,
+                        "created": int(time.time()),
+                        "object": "chat.completion.chunk",
+                        "model": "unknown",
+                        "choices": [choice_data],
+                    }
+
+                    if output.finish_reason:
+                        chunk["usage"] = BaseWorkerHandler._build_completion_usage(
+                            request_output=res,
+                        )
+
+                    yield chunk
+
+            except EngineDeadError as e:
+                logger.error(f"vLLM EngineDeadError: {e}")
+                logger.warning("Initiating Dynamo Runtime shutdown.")
+                self.runtime.shutdown()
+                os._exit(1)
+            finally:
+                if multi_modal_data is not None:
+                    self.image_loader.mark_consumed()
 
 
 class PrefillWorkerHandler(BaseWorkerHandler):
