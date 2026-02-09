@@ -22,7 +22,6 @@ from io import BytesIO
 from typing import TypeAlias, Union
 from urllib.parse import urlparse
 
-import httpx
 import pybase64
 import torch
 from PIL import Image
@@ -54,6 +53,7 @@ def _get_nvimgcodec():
     global _nvimgcodec
     if _nvimgcodec is None:
         from nvidia import nvimgcodec
+
         _nvimgcodec = nvimgcodec
     return _nvimgcodec
 
