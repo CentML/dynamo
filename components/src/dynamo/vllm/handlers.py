@@ -1365,7 +1365,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 os._exit(1)
             finally:
                 if multi_modal_data is not None:
-                    self.image_loader.mark_consumed()
+                    images = multi_modal_data.get("image")
+                    count = len(images) if isinstance(images, list) else 1
+                    self.image_loader.mark_consumed(count)
 
     async def _generate_text_mode(self, request, context, request_id):
         """Generate text using OpenAI-compatible format (text-in-text-out)."""
@@ -1460,7 +1462,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 os._exit(1)
             finally:
                 if multi_modal_data is not None:
-                    self.image_loader.mark_consumed()
+                    images = multi_modal_data.get("image")
+                    count = len(images) if isinstance(images, list) else 1
+                    self.image_loader.mark_consumed(count)
 
 
 class PrefillWorkerHandler(BaseWorkerHandler):
@@ -1614,3 +1618,8 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 raise GeneratorExit(
                     "Prefill engine was shut down during token generation"
                 ) from None
+            finally:
+                if multi_modal_data is not None:
+                    images = multi_modal_data.get("image")
+                    count = len(images) if isinstance(images, list) else 1
+                    self.image_loader.mark_consumed(count)
