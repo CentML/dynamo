@@ -68,12 +68,10 @@ def get_decoder():
 
 
 class ImageLoader:
-    CACHE_SIZE_MAXIMUM = 8
     DEFAULT_MAX_PENDING = 64
 
     def __init__(
         self,
-        cache_size: int = CACHE_SIZE_MAXIMUM,
         http_timeout: float = 30.0,
         use_nvimgcodec: bool = True,
         image_mode: str = "RGB",
@@ -83,7 +81,6 @@ class ImageLoader:
         Initialize the ImageLoader.
 
         Args:
-            cache_size: Maximum number of images to cache
             http_timeout: Timeout for HTTP requests
             use_nvimgcodec: If True, use nvimgcodec for GPU-accelerated decoding
                            (returns 4D torch.Tensor). If False, use PIL (returns Image.Image)
@@ -96,8 +93,6 @@ class ImageLoader:
         self._http_timeout = http_timeout
         self._use_nvimgcodec = use_nvimgcodec
         self._image_mode = image_mode
-        self._image_cache: dict[str, ImageOutput] = {}
-        self._cache_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=cache_size)
 
         if max_pending is None:
             max_pending = int(
@@ -219,23 +214,14 @@ class ImageLoader:
         Returns:
             torch.Tensor in NCHW format (if use_nvimgcodec=True) or PIL Image
         """
-        parsed_url = urlparse(image_url)
+        # Fetch image bytes (before acquiring semaphore so fetch errors don't leak)
+        image_bytes = await self._fetch_image_bytes(image_url)
 
-        # For HTTP(S) URLs, check cache first
-        if parsed_url.scheme in ("http", "https"):
-            image_url_lower = image_url.lower()
-            if image_url_lower in self._image_cache:
-                logger.debug(f"Image found in cache for URL: {image_url}")
-                return self._image_cache[image_url_lower]
+        # Wait if too many decoded images are pending in the vLLM scheduler.
+        # Released when the caller invokes mark_consumed() after prefill.
+        await self._pending_semaphore.acquire()
 
         try:
-            # Fetch image bytes
-            image_bytes = await self._fetch_image_bytes(image_url)
-
-            # Wait if too many decoded images are pending in the vLLM scheduler.
-            # Released when the caller invokes mark_consumed() after prefill.
-            await self._pending_semaphore.acquire()
-
             # Decode the image using thread pool to avoid blocking event loop
             loop = asyncio.get_running_loop()
             if self._use_nvimgcodec:
@@ -250,22 +236,9 @@ class ImageLoader:
                     _decode_thread_pool, self._decode_with_pil, image_bytes
                 )
 
-            # Cache HTTP(S) URLs
-            if parsed_url.scheme in ("http", "https"):
-                image_url_lower = image_url.lower()
-                # Cache the image for future use, and evict the oldest image if full
-                if self._cache_queue.full():
-                    oldest_image_url = await self._cache_queue.get()
-                    del self._image_cache[oldest_image_url]
-
-                self._image_cache[image_url_lower] = image_result
-                await self._cache_queue.put(image_url_lower)
-
             return image_result
 
-        except httpx.HTTPError as e:
-            logger.error(f"HTTP error loading image: {e}")
+        except Exception:
+            # Release semaphore on decode failure to prevent leak
+            self._pending_semaphore.release()
             raise
-        except Exception as e:
-            logger.error(f"Error loading image: {e}")
-            raise ValueError(f"Failed to load image: {e}")

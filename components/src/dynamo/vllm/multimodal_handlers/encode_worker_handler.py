@@ -58,7 +58,7 @@ class EncodeWorkerHandler:
         self.engine_args = engine_args
         self.model = self.engine_args.model
 
-        self.image_loader = ImageLoader(cache_size=CACHE_SIZE_MAXIMUM)
+        self.image_loader = ImageLoader()
         self.image_processor = AutoImageProcessor.from_pretrained(
             self.model, trust_remote_code=True
         )
