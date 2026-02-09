@@ -1384,9 +1384,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 prompt_token_ids=input_data, multi_modal_data=multi_modal_data
             )
         else:
-            prompt = TextPrompt(
-                prompt=input_data, multi_modal_data=multi_modal_data
-            )
+            prompt = TextPrompt(prompt=input_data, multi_modal_data=multi_modal_data)
 
         # Build sampling params from OpenAI-style request
         sampling_params = build_sampling_params_openai(
@@ -1394,9 +1392,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         )
 
         dp_rank = request.get("dp_rank", None)
-        openai_request_id = request.get("id") or request.get(
-            "request_id", request_id
-        )
+        openai_request_id = request.get("id") or request.get("request_id", request_id)
         previous_text = ""
 
         trace_headers = build_trace_headers(context)
