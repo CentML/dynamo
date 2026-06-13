@@ -4,10 +4,12 @@
 """Unit tests for dynamo.vllm.multimodal_utils.model."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from dynamo.vllm.multimodal_utils import model as model_mod
 from dynamo.vllm.multimodal_utils.model import (
     ModelFamily,
     construct_qwen_decode_mm_data,
@@ -20,6 +22,17 @@ pytestmark = [
     pytest.mark.gpu_0,
     pytest.mark.multimodal,
 ]
+
+
+def _fake_vllm_model_with_visual(visual):
+    model_runner = SimpleNamespace(model=SimpleNamespace(visual=visual))
+    worker = SimpleNamespace(model_runner=model_runner)
+    driver_worker = SimpleNamespace(worker=worker)
+    model_executor = SimpleNamespace(driver_worker=driver_worker)
+    inner_core = SimpleNamespace(model_executor=model_executor)
+    engine_core = SimpleNamespace(engine_core=inner_core)
+    llm_engine = SimpleNamespace(engine_core=engine_core)
+    return SimpleNamespace(llm_engine=llm_engine)
 
 
 class TestMultiModalUtils:
@@ -46,6 +59,77 @@ class TestMultiModalUtils:
             )
             # Embedding values are randomly genearted as placehodler, we only check the shape
             assert mm_data["image"]["image_embeds"].shape == (2, 1024)
+
+
+class TestLoadVisionModel:
+    def test_encoder_worker_uses_regular_vllm_engine_args(self, monkeypatch):
+        captured_kwargs = {}
+        visual = object()
+
+        def fake_llm(*, chat_template=None, **kwargs):
+            captured_kwargs.update(kwargs)
+            captured_kwargs["chat_template"] = chat_template
+            return _fake_vllm_model_with_visual(visual)
+
+        engine_args = SimpleNamespace(
+            model="Qwen/Qwen2-VL-2B-Instruct",
+            enforce_eager=True,
+            tensor_parallel_size=2,
+            dtype="bfloat16",
+            gpu_memory_utilization=0.73,
+            kv_cache_memory_bytes=123456,
+            max_model_len=2048,
+            enable_prefix_caching=True,
+            chat_template="/tmp/qwen-template.jinja",
+            mm_encoder_only=False,
+            enable_log_requests=True,
+            dynamo_internal_only=True,
+        )
+        monkeypatch.setattr(model_mod, "LLM", fake_llm)
+        monkeypatch.setattr(model_mod, "update_environment_variables", lambda _: None)
+
+        result = model_mod.load_vision_model(
+            "Qwen/Qwen2-VL-2B-Instruct", engine_args=engine_args
+        )
+
+        assert result is visual
+        assert captured_kwargs["model"] == "Qwen/Qwen2-VL-2B-Instruct"
+        assert captured_kwargs["enforce_eager"] is True
+        assert captured_kwargs["tensor_parallel_size"] == 2
+        assert captured_kwargs["dtype"] == "bfloat16"
+        assert captured_kwargs["gpu_memory_utilization"] == 0.73
+        assert captured_kwargs["kv_cache_memory_bytes"] == 123456
+        assert captured_kwargs["max_model_len"] == 2048
+        assert captured_kwargs["enable_prefix_caching"] is True
+        assert captured_kwargs["chat_template"] == "/tmp/qwen-template.jinja"
+        assert captured_kwargs["mm_encoder_only"] is True
+        assert "enable_log_requests" not in captured_kwargs
+        assert "dynamo_internal_only" not in captured_kwargs
+
+    def test_encoder_worker_preserves_legacy_defaults_without_engine_args(
+        self, monkeypatch
+    ):
+        captured_kwargs = {}
+        visual = object()
+
+        def fake_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _fake_vllm_model_with_visual(visual)
+
+        monkeypatch.setattr(model_mod, "LLM", fake_llm)
+        monkeypatch.setattr(model_mod, "update_environment_variables", lambda _: None)
+
+        result = model_mod.load_vision_model(
+            "Qwen/Qwen2-VL-2B-Instruct", enforce_eager=True
+        )
+
+        assert result is visual
+        assert captured_kwargs["enforce_eager"] is True
+        assert captured_kwargs["gpu_memory_utilization"] == 0.2
+        assert captured_kwargs["kv_cache_memory_bytes"] == 1024 * 1024 * 64
+        assert captured_kwargs["max_model_len"] == 1
+        assert captured_kwargs["mm_encoder_only"] is True
+        assert captured_kwargs["enable_prefix_caching"] is False
 
 
 class TestResolveModelFamily:

@@ -14,9 +14,11 @@
 # limitations under the License.
 
 import functools
+import inspect
 import json
 import logging
 import os
+from dataclasses import fields
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -155,7 +157,70 @@ def resolve_model_family(model_name: str) -> Optional[ModelFamily]:
     return None
 
 
-def load_vision_model(model_id: str, enforce_eager: bool = False) -> torch.nn.Module:
+def _vllm_llm_compatible_arg_names() -> set[str]:
+    llm_arg_names = set()
+    accepts_engine_kwargs = False
+    for name, parameter in inspect.signature(LLM).parameters.items():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            accepts_engine_kwargs = True
+            continue
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            llm_arg_names.add(name)
+
+    if not accepts_engine_kwargs:
+        return llm_arg_names
+
+    from vllm.engine.arg_utils import EngineArgs
+
+    return llm_arg_names | {field.name for field in fields(EngineArgs)}
+
+
+def _vllm_llm_kwargs(
+    model_id: str,
+    *,
+    enforce_eager: bool,
+    engine_args: Optional[Any],
+) -> Dict[str, Any]:
+    """Build kwargs for the vLLM LLM encoder-only instance."""
+    if engine_args is None:
+        # Compatibility fallback for direct callers that do not have parsed
+        # vLLM args. Encode workers pass engine_args and use the broad path below.
+        return {
+            "model": model_id,
+            "enforce_eager": enforce_eager,
+            # vLLM's free-memory precheck runs before kv_cache_memory_bytes applies;
+            # default 0.9 fails on <=24 GiB GPUs when another worker shares the device.
+            "gpu_memory_utilization": 0.2,
+            "kv_cache_memory_bytes": 1024 * 1024 * 64,
+            "max_model_len": 1,
+            "mm_encoder_only": True,
+            "enable_prefix_caching": False,
+        }
+
+    vllm_arg_names = _vllm_llm_compatible_arg_names()
+    kwargs = {
+        name: value
+        for name, value in vars(engine_args).items()
+        if name in vllm_arg_names
+    }
+    dropped_args = sorted(set(vars(engine_args)) - set(kwargs))
+    if dropped_args:
+        logger.debug(
+            "Dropping non-EngineArgs fields for encoder-only vLLM LLM: %s",
+            dropped_args,
+        )
+
+    kwargs["model"] = model_id
+    kwargs["mm_encoder_only"] = True
+    return kwargs
+
+
+def load_vision_model(
+    model_id: str, enforce_eager: bool = False, engine_args: Optional[Any] = None
+) -> torch.nn.Module:
     """
     Load a vision model from a HuggingFace model ID.
     """
@@ -169,19 +234,10 @@ def load_vision_model(model_id: str, enforce_eager: bool = False) -> torch.nn.Mo
 
         # Load only the vision model via vLLM on encoder workers to avoid loading the full LLM weights, significantly reducing memory usage.
         # Uses native vLLM encoder only model loading added in https://github.com/vllm-project/vllm/pull/32605.
-        # Load only the vision model via vLLM
         vllm_model = LLM(
-            model=model_id,
-            enforce_eager=enforce_eager,
-            # vLLM's free-memory precheck runs before kv_cache_memory_bytes applies;
-            # default 0.9 fails on <=24 GiB GPUs when another worker shares the device.
-            gpu_memory_utilization=0.2,
-            kv_cache_memory_bytes=1024
-            * 1024
-            * 64,  # 64MB KV cache for vLLM to complete the init lifecycle, encoder-only doesn't require KV cache.
-            max_model_len=1,
-            mm_encoder_only=True,
-            enable_prefix_caching=False,
+            **_vllm_llm_kwargs(
+                model_id, enforce_eager=enforce_eager, engine_args=engine_args
+            )
         )
         return (
             vllm_model.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner.model.visual
